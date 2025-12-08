@@ -123,7 +123,14 @@ class ModelRunner:
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
-    def prepare_prefill(self, seqs: list[Sequence]):
+    def prepare_prefill(self, seqs: list[Sequence], prefill_info: dict | None = None):
+        """
+        准备Prefill输入
+        
+        Args:
+            seqs: 序列列表
+            prefill_info: PD分离模式下的prefill信息，包含chunk_starts和chunk_ends
+        """
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -132,27 +139,52 @@ class ModelRunner:
         max_seqlen_k = 0
         slot_mapping = []
         block_tables = None
-        for seq in seqs:
-            seqlen = len(seq)
-            input_ids.extend(seq[seq.num_cached_tokens:])
-            positions.extend(list(range(seq.num_cached_tokens, seqlen)))
-            seqlen_q = seqlen - seq.num_cached_tokens
-            seqlen_k = seqlen
+        
+        for i, seq in enumerate(seqs):
+            # 确定本次prefill的范围
+            if prefill_info is not None:
+                # PD分离模式：使用chunk信息
+                chunk_start = prefill_info["chunk_starts"][i]
+                chunk_end = prefill_info["chunk_ends"][i]
+            else:
+                # 普通模式：从cached位置开始
+                chunk_start = seq.num_cached_tokens
+                chunk_end = len(seq)
+            
+            seqlen_k = chunk_end  # attention需要看到的上下文长度
+            seqlen_q = chunk_end - chunk_start  # 本次处理的token数
+            
+            input_ids.extend(seq[chunk_start:chunk_end])
+            positions.extend(list(range(chunk_start, chunk_end)))
+            
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
+            
             if not seq.block_table:    # warmup
                 continue
-            for i in range(seq.num_cached_blocks, seq.num_blocks):
-                start = seq.block_table[i] * self.block_size
-                if i != seq.num_blocks - 1:
-                    end = start + self.block_size
-                else:
-                    end = start + seq.last_block_num_tokens 
-                slot_mapping.extend(list(range(start, end)))
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
+            
+            # 计算slot_mapping：只为本次chunk的token计算
+            start_block = chunk_start // self.block_size
+            end_block = (chunk_end + self.block_size - 1) // self.block_size
+            
+            for block_idx in range(start_block, min(end_block, len(seq.block_table))):
+                block_start_pos = block_idx * self.block_size
+                block_end_pos = (block_idx + 1) * self.block_size
+                
+                # 计算在这个block中需要写入的范围
+                write_start = max(chunk_start, block_start_pos)
+                write_end = min(chunk_end, block_end_pos)
+                
+                if write_start < write_end:
+                    slot_start = seq.block_table[block_idx] * self.block_size + (write_start - block_start_pos)
+                    slot_end = slot_start + (write_end - write_start)
+                    slot_mapping.extend(list(range(slot_start, slot_end)))
+        
+        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache or chunked prefill
             block_tables = self.prepare_block_tables(seqs)
+        
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -205,11 +237,47 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+    def run(self, seqs: list[Sequence], is_prefill: bool, prefill_info: dict | None = None) -> list[int]:
+        """
+        执行模型前向传播
+        
+        Args:
+            seqs: 序列列表
+            is_prefill: 是否是prefill阶段
+            prefill_info: PD分离模式下的prefill信息
+        """
+        if is_prefill:
+            input_ids, positions = self.prepare_prefill(seqs, prefill_info)
+        else:
+            input_ids, positions = self.prepare_decode(seqs)
+        
         logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        
+        if self.rank == 0:
+            if is_prefill and prefill_info is not None:
+                # PD分离模式的chunked prefill：只对完成prefill的序列采样
+                # 找出哪些序列在这次chunk后完成了prefill
+                completed_indices = []
+                for i, seq in enumerate(seqs):
+                    chunk_end = prefill_info["chunk_ends"][i]
+                    if chunk_end >= seq.num_prompt_tokens:
+                        completed_indices.append(i)
+                
+                if completed_indices:
+                    # logits已经是[num_seqs, vocab_size]形状（LMHead已选择最后token）
+                    # 只需按序列索引选择完成prefill的序列
+                    completed_logits = logits[completed_indices]
+                    temperatures = self.prepare_sample([seqs[i] for i in completed_indices])
+                    token_ids = self.sampler(completed_logits, temperatures).tolist()
+                else:
+                    token_ids = []
+            else:
+                # 普通模式或decode模式：对所有序列采样
+                temperatures = self.prepare_sample(seqs)
+                token_ids = self.sampler(logits, temperatures).tolist()
+        else:
+            token_ids = None
+        
         reset_context()
         return token_ids
 

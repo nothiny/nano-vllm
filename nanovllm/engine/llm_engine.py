@@ -9,6 +9,7 @@ from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
+from nanovllm.engine.pd_scheduler import PDScheduler
 from nanovllm.engine.model_runner import ModelRunner
 
 
@@ -18,6 +19,8 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        self.config = config
+        self.enable_pd_disaggregation = config.enable_pd_disaggregation
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
@@ -30,10 +33,23 @@ class LLMEngine:
         self.model_runner = ModelRunner(config, 0, self.events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
-        self.scheduler = Scheduler(config)
+        # 根据配置选择调度器
+        if self.enable_pd_disaggregation:
+            self.scheduler = PDScheduler(config)
+        else:
+            self.scheduler = Scheduler(config)
+        self._exited = False
         atexit.register(self.exit)
 
     def exit(self):
+        """清理资源，可以安全地多次调用"""
+        if self._exited:
+            return
+        self._exited = True
+        try:
+            atexit.unregister(self.exit)
+        except Exception:
+            pass
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
@@ -46,11 +62,45 @@ class LLMEngine:
         self.scheduler.add(seq)
 
     def step(self):
+        if self.enable_pd_disaggregation:
+            return self._step_pd()
+        else:
+            return self._step_normal()
+
+    def _step_normal(self):
+        """普通调度模式的step"""
         seqs, is_prefill = self.scheduler.schedule()
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
+        return outputs, num_tokens
+
+    def _step_pd(self):
+        """PD分离调度模式的step"""
+        seqs, is_prefill, prefill_info = self.scheduler.schedule()
+        
+        if not seqs:
+            return [], 0
+        
+        # 执行模型
+        token_ids = self.model_runner.call("run", seqs, is_prefill, prefill_info)
+        
+        # 后处理
+        self.scheduler.postprocess(seqs, token_ids, is_prefill, prefill_info)
+        
+        # 收集输出
+        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        
+        # 计算token数量用于吞吐量统计
+        if is_prefill:
+            # prefill阶段：统计处理的总token数
+            num_tokens = sum(prefill_info["chunk_ends"][i] - prefill_info["chunk_starts"][i] 
+                           for i in range(len(seqs)))
+        else:
+            # decode阶段：负数表示decode的sequence数量
+            num_tokens = -len(seqs)
+        
         return outputs, num_tokens
 
     def is_finished(self):

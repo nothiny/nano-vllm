@@ -6,9 +6,11 @@ from nanovllm.sampling_params import SamplingParams
 
 
 class SequenceStatus(Enum):
-    WAITING = auto()
-    RUNNING = auto()
-    FINISHED = auto()
+    WAITING = auto()      # 等待prefill
+    PREFILLING = auto()   # 正在进行prefill（用于chunked prefill）
+    DECODING = auto()     # 正在decode
+    RUNNING = auto()      # 兼容旧调度器
+    FINISHED = auto()     # 已完成
 
 
 class Sequence:
@@ -27,6 +29,9 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        # PD分离: chunked prefill 相关
+        self.num_prefilled_tokens = 0  # 已经prefill的token数量
+        self.prefill_complete = False  # prefill是否完成
 
     def __len__(self):
         return self.num_tokens
@@ -37,6 +42,16 @@ class Sequence:
     @property
     def is_finished(self):
         return self.status == SequenceStatus.FINISHED
+
+    @property
+    def remaining_prefill_tokens(self):
+        """剩余需要prefill的token数"""
+        return self.num_prompt_tokens - self.num_prefilled_tokens
+
+    @property
+    def is_prefill_complete(self):
+        """prefill是否已完成"""
+        return self.num_prefilled_tokens >= self.num_prompt_tokens
 
     @property
     def num_completion_tokens(self):

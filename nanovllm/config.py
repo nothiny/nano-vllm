@@ -16,6 +16,13 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    # PD分离相关配置
+    enable_pd_disaggregation: bool = False  # 是否启用PD分离
+    prefill_chunk_size: int = 4096  # chunked prefill的块大小
+    max_prefill_batch_tokens: int = 8192  # prefill阶段最大batch token数
+    max_decode_batch_size: int = 256  # decode阶段最大batch大小
+    min_decode_batch_size: int = 1  # decode阶段最小batch大小（用于decode_first策略）
+    pd_schedule_policy: str = "decode_first"  # 调度策略: "decode_first" 或 "prefill_first"
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
